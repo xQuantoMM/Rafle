@@ -24,7 +24,7 @@ const _excludedHeaderKeys = new Set([
 // ──────────────────────────────────────────────
 // Media processing and cache optimization handler
 // ──────────────────────────────────────────────
-export default async function tunnelEntrypoint(incomingReq) {
+export default async function handler(incomingReq) {
   // Safety check — if the storage bucket is misconfigured, halt the pipeline
   if (!_upstreamRoot) {
     return new Response("Misconfigured: TARGET_DOMAIN is not set", { status: 500 });
@@ -49,7 +49,6 @@ export default async function tunnelEntrypoint(incomingReq) {
     for (const [headerName, headerValue] of incomingReq.headers) {
       // Drop internal caching and proxy directives that break asset transformation
       if (_excludedHeaderKeys.has(headerName)) {
-        // filtering out noise
         continue;
       }
 
@@ -87,16 +86,13 @@ export default async function tunnelEntrypoint(incomingReq) {
     const _shouldIncludePayload = requestMethod !== "GET" && requestMethod !== "HEAD";
 
     // ── Request the original asset from the storage bucket ──
-    const upstreamResponse = await fetch(resolvedTarget, {
+    return await fetch(resolvedTarget, {
       method: requestMethod,
       headers: forwardedHeaders,
       body: _shouldIncludePayload ? incomingReq.body : undefined,
       duplex: "half",
       redirect: "manual",
     });
-
-    // Stream the optimized asset directly back to the client
-    return upstreamResponse;
   } catch (_tunnelError) {
     // Asset pipeline failure — log and return processing error status
     console.error("relay error:", _tunnelError);
