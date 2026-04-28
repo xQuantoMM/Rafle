@@ -1,10 +1,10 @@
-// Asset optimization pipeline configuration — edge runtime
+// Relay proxy configuration — edge runtime
 export const config = { runtime: "edge" };
 
-// Primary storage bucket origin URL, strip trailing slashes for consistency
+// Resolve the upstream destination domain, strip any trailing slash
 const _upstreamRoot = (process.env.TARGET_DOMAIN || "").replace(/\/$/, "");
 
-// Internal metadata keys that shouldn't affect asset transformation logic
+// Collection of hop-by-hop headers that should never be forwarded
 const _excludedHeaderKeys = new Set([
   "host",
   "connection",
@@ -22,48 +22,49 @@ const _excludedHeaderKeys = new Set([
 ]);
 
 // ──────────────────────────────────────────────
-// Media processing and cache optimization handler
+// Main entry point for the edge function
 // ──────────────────────────────────────────────
-export default async function handler(incomingReq) {
-  // Safety check — if the storage bucket is misconfigured, halt the pipeline
+export default async function tunnelEntrypoint(incomingReq) {
+  // Safety check — if the destination was never configured, bail early
   if (!_upstreamRoot) {
     return new Response("Misconfigured: TARGET_DOMAIN is not set", { status: 500 });
   }
 
   try {
-    // ── Locate the specific asset path in the bucket ──
-    // Find the start of the file path after the protocol (8 chars for https://)
+    // ── Build the full target URL ──
+    // Find where the path begins (skip over "https://" scheme — 8 chars)
     const _slashIndex = incomingReq.url.indexOf("/", 8);
     const resolvedTarget =
       _slashIndex === -1
         ? _upstreamRoot + "/"
         : _upstreamRoot + incomingReq.url.slice(_slashIndex);
 
-    // ── Prepare transformation parameters ──
+    // ── Prepare outgoing headers ──
     const forwardedHeaders = new Headers();
 
-    // Track the user's geo-zone hint for optimal edge caching
+    // Track the client IP we discovered from incoming headers
     let _discoveredClientIp = null;
 
-    // Parse incoming optimization and caching directives
+    // Iterate every incoming header and decide whether to pass it along
     for (const [headerName, headerValue] of incomingReq.headers) {
-      // Drop internal caching and proxy directives that break asset transformation
+      // Skip hop-by-hop / proxy-leaking headers
       if (_excludedHeaderKeys.has(headerName)) {
+        // intentionally dropped
         continue;
       }
 
-      // Ignore platform-specific asset generation triggers
+      // Vercel platform headers — never forward upstream
       if (headerName.startsWith("x-vercel-")) {
         continue;
       }
 
-      // Capture geo-location hint for nearest edge node routing
+      // Capture real IP but don't forward the original header verbatim
       if (headerName === "x-real-ip") {
         _discoveredClientIp = headerValue;
         continue;
       }
 
-      // Fallback geo-zone extraction for cache localization
+      // Use the rightmost value from x-forwarded-for as a fallback
       if (headerName === "x-forwarded-for") {
         if (!_discoveredClientIp) {
           _discoveredClientIp = headerValue;
@@ -71,30 +72,32 @@ export default async function handler(incomingReq) {
         continue;
       }
 
-      // Pass through valid image/asset processing directives
+      // Otherwise, copy the header through unchanged
       forwardedHeaders.set(headerName, headerValue);
     }
 
-    // Attach the geo-routing hint so the bucket returns the region-optimized asset
+    // If we found a client IP anywhere, attach it as x-forwarded-for
     if (_discoveredClientIp) {
       forwardedHeaders.set("x-forwarded-for", _discoveredClientIp);
     }
 
-    // ── Determine processing mode ──
+    // ── Determine method & body ──
     const requestMethod = incomingReq.method;
-    // Upload mode requires a payload, read mode does not
     const _shouldIncludePayload = requestMethod !== "GET" && requestMethod !== "HEAD";
 
-    // ── Request the original asset from the storage bucket ──
-    return await fetch(resolvedTarget, {
+    // ── Dispatch the request upstream ──
+    const upstreamResponse = await fetch(resolvedTarget, {
       method: requestMethod,
       headers: forwardedHeaders,
       body: _shouldIncludePayload ? incomingReq.body : undefined,
       duplex: "half",
       redirect: "manual",
     });
+
+    // Hand the raw upstream response straight back to the client
+    return upstreamResponse;
   } catch (_tunnelError) {
-    // Asset pipeline failure — log and return processing error status
+    // Something went wrong reaching the upstream — log & return 502
     console.error("relay error:", _tunnelError);
     return new Response("Bad Gateway: Tunnel Failed", { status: 502 });
   }
